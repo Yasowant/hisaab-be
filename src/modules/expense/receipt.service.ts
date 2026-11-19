@@ -1,16 +1,15 @@
-import mongoose, { isValidObjectId, Types } from "mongoose";
 import { Readable } from "node:stream";
-import { ExpenseModel } from "./expense.model";
+import { prisma } from "../../config/db";
 import { GroupDoc } from "../group/group.model";
 import { AppError } from "../../utils/AppError";
 import { logger } from "../../utils/logger";
+import { isId } from "../../utils/id";
 import { cloudinary, cloudinaryEnabled } from "../../utils/cloudinary";
 
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // the app shrinks photos well below this
 export const MAX_PDF_BYTES = 10 * 1024 * 1024;
 export const RECEIPT_TYPES = ["image/jpeg", "image/png", "image/webp", "application/pdf"];
 
-const bucket = () => new mongoose.mongo.GridFSBucket(mongoose.connection.db!, { bucketName: "receipts" });
 const extension: Record<string, string> = { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "application/pdf": "pdf" };
 
 /** Trust the file's first bytes, not the Content-Type header someone sent. */
@@ -22,33 +21,52 @@ function fileType(buf: Buffer): string | null {
   return null;
 }
 
+/** The receipt's details, without the file bytes. */
+const receiptMeta = {
+  provider: true,
+  publicId: true,
+  format: true,
+  contentType: true,
+  size: true,
+  byId: true,
+  at: true,
+} as const;
+
 async function loadExpense(group: GroupDoc, expenseId: string) {
-  if (!isValidObjectId(expenseId)) throw new AppError(404, "Expense not found");
-  const e = await ExpenseModel.findOne({ _id: expenseId, groupId: group._id, deletedAt: null }, "paidBy createdBy splits receipt").lean();
+  if (!isId(expenseId)) throw new AppError(404, "Expense not found");
+  const e = await prisma.expense.findFirst({
+    where: { id: expenseId, groupId: group.id, deletedAt: null },
+    select: {
+      paidById: true,
+      createdById: true,
+      splits: { select: { userId: true } },
+      receipt: { select: receiptMeta },
+    },
+  });
   if (!e) throw new AppError(404, "Expense not found");
   return e;
 }
 
 type Loaded = Awaited<ReturnType<typeof loadExpense>>;
-type Stored = NonNullable<Loaded["receipt"]>;
+type Stored = { provider: "database" | "cloudinary"; publicId: string | null };
 
 /** Anyone in the expense (payer, creator, a share), the person who added the file, or an admin. */
 function ensureCanEdit(e: Loaded, userId: string, role: string) {
   const involved =
-    String(e.paidBy) === userId ||
-    String(e.createdBy) === userId ||
-    e.splits.some((s) => String(s.userId) === userId) ||
-    (e.receipt && String(e.receipt.by) === userId);
+    e.paidById === userId ||
+    e.createdById === userId ||
+    e.splits.some((s) => s.userId === userId) ||
+    e.receipt?.byId === userId;
   if (role !== "admin" && !involved) {
     throw new AppError(403, "Only people in this expense, or a group admin, can change its receipt");
   }
 }
 
-/** Remove a stored file (old or replaced); a failure is logged, never shown to the user. */
+/** Remove a replaced file from Cloudinary; a failure is logged, never shown to the user. */
 async function removeStored(r: Stored) {
+  if (r.provider !== "cloudinary" || !r.publicId) return; // database copies go with their row
   try {
-    if (r.provider === "cloudinary" && r.publicId) await cloudinary.destroy(r.publicId, "image", "authenticated");
-    else if (r.fileId) await bucket().delete(r.fileId);
+    await cloudinary.destroy(r.publicId, "image", "authenticated");
   } catch (err) {
     logger.warn({ err }, "Couldn't delete old receipt file");
   }
@@ -65,40 +83,36 @@ export const receiptService = {
     const limit = contentType === "application/pdf" ? MAX_PDF_BYTES : MAX_IMAGE_BYTES;
     if (body.length > limit) throw new AppError(413, `That file is over ${limit / 1024 / 1024} MB`);
 
-    let stored: Omit<Stored, "by" | "at">;
-    if (cloudinaryEnabled()) {
-      // "authenticated": no public link; only our server can fetch it, for group members
-      const up = await cloudinary.upload(body, contentType, {
-        folder: `hisaab/receipts/${group._id}`,
-        type: "authenticated",
-      });
-      stored = { provider: "cloudinary", fileId: null, publicId: up.public_id, format: up.format || extension[contentType]!, contentType, size: body.length };
-    } else {
-      const fileId = new Types.ObjectId();
-      await new Promise<void>((resolve, reject) => {
-        Readable.from(body)
-          .pipe(bucket().openUploadStreamWithId(fileId, `receipt-${expenseId}`, { metadata: { contentType, groupId: group._id, expenseId } }))
-          .on("finish", () => resolve())
-          .on("error", reject);
-      });
-      stored = { provider: "gridfs", fileId, publicId: null, format: extension[contentType]!, contentType, size: body.length };
-    }
+    const stored = cloudinaryEnabled()
+      ? await (async () => {
+          // "authenticated": no public link; only our server can fetch it, for group members
+          const up = await cloudinary.upload(body, contentType, {
+            folder: `hisaab/receipts/${group.id}`,
+            type: "authenticated",
+          });
+          return { provider: "cloudinary" as const, data: null, publicId: up.public_id, format: up.format || extension[contentType]! };
+        })()
+      : { provider: "database" as const, data: new Uint8Array(body), publicId: null, format: extension[contentType]! };
 
-    const receipt = { ...stored, by: new Types.ObjectId(userId), at: new Date() };
-    const before = await ExpenseModel.findOneAndUpdate(
-      { _id: expenseId, groupId: group._id, deletedAt: null },
-      { $set: { receipt } },
-      { returnDocument: "before", projection: { receipt: 1 } },
-    ).lean();
+    const receipt = { ...stored, contentType, size: body.length, byId: userId, at: new Date() };
+
+    // The expense may have been deleted meanwhile; check and save together
+    const before = await prisma.$transaction(async (tx) => {
+      const live = await tx.expense.findFirst({ where: { id: expenseId, groupId: group.id, deletedAt: null }, select: { id: true } });
+      if (!live) return null;
+      const old = await tx.expenseReceipt.findUnique({ where: { expenseId }, select: { provider: true, publicId: true } });
+      await tx.expenseReceipt.upsert({ where: { expenseId }, create: { expenseId, ...receipt }, update: receipt });
+      return { old };
+    });
     if (!before) {
-      await removeStored(receipt as Stored);
+      await removeStored(receipt);
       throw new AppError(404, "Expense not found");
     }
-    if (before.receipt) await removeStored(before.receipt);
+    if (before.old && before.old.publicId !== receipt.publicId) await removeStored(before.old);
     return { size: body.length, contentType };
   },
 
-  /** The file as a stream, whichever place it's stored in. */
+  /** The file as a stream, wherever it's stored. */
   async open(group: GroupDoc, expenseId: string): Promise<{ stream: NodeJS.ReadableStream; contentType: string; size: number }> {
     const e = await loadExpense(group, expenseId);
     const r = e.receipt;
@@ -111,14 +125,17 @@ export const receiptService = {
       }
       return { stream: Readable.fromWeb(res.body as never), contentType: r.contentType, size: r.size };
     }
-    return { stream: bucket().openDownloadStream(r.fileId!), contentType: r.contentType, size: r.size };
+    const file = await prisma.expenseReceipt.findUnique({ where: { expenseId }, select: { data: true } });
+    if (!file?.data) throw new AppError(404, "This expense has no receipt");
+    return { stream: Readable.from([Buffer.from(file.data)]), contentType: r.contentType, size: r.size };
   },
 
   async remove(group: GroupDoc, userId: string, role: string, expenseId: string) {
     const e = await loadExpense(group, expenseId);
     ensureCanEdit(e, userId, role);
     if (!e.receipt) throw new AppError(404, "This expense has no receipt");
-    const res = await ExpenseModel.updateOne({ _id: expenseId, receipt: { $ne: null }, "receipt.at": e.receipt.at }, { $set: { receipt: null } });
-    if (res.modifiedCount > 0) await removeStored(e.receipt);
+    // Only if it's still the same file (nobody replaced it meanwhile)
+    const res = await prisma.expenseReceipt.deleteMany({ where: { expenseId, at: e.receipt.at } });
+    if (res.count > 0) await removeStored(e.receipt);
   },
 };

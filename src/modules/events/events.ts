@@ -4,7 +4,8 @@ import { Request, Response, NextFunction } from "express";
 /**
  * Live updates: when something changes in a group, everyone with that group
  * open is told to reload. Kept in this server's memory, which is fine for one
- * server. With several servers behind a load balancer, swap this for Redis pub/sub.
+ * server. With several servers behind a load balancer, swap this for Redis pub/sub
+ * (or PostgreSQL LISTEN/NOTIFY).
  */
 const bus = new EventEmitter();
 bus.setMaxListeners(0); // one listener per open browser tab
@@ -19,7 +20,7 @@ export function publish(groupId: string, by: string) {
 export const notifyGroupOnChange = (req: Request, res: Response, next: NextFunction) => {
   if (req.method !== "GET") {
     res.on("finish", () => {
-      if (res.statusCode < 300 && req.group && req.user) publish(String(req.group._id), req.user.id);
+      if (res.statusCode < 300 && req.group && req.user) publish(req.group.id, req.user.id);
     });
   }
   next();
@@ -27,7 +28,7 @@ export const notifyGroupOnChange = (req: Request, res: Response, next: NextFunct
 
 /** GET /groups/:groupId/events: a Server-Sent Events stream that stays open. */
 export function streamGroupEvents(req: Request, res: Response) {
-  const groupId = String(req.group!._id);
+  const groupId = req.group!.id;
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",

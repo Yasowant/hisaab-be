@@ -4,7 +4,8 @@ import { z } from 'zod';
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
   PORT: z.coerce.number().default(5001),
-  MONGO_URI: z.string().min(1, 'MONGO_URI is required'),
+  // PostgreSQL connection string, e.g. postgresql://user:pass@host:5432/hisaab
+  DATABASE_URL: z.string().min(1, 'DATABASE_URL is required'),
   CORS_ORIGIN: z.string().default('http://localhost:5173'),
   JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
   ACCESS_TOKEN_TTL_MIN: z.coerce.number().int().min(1).max(60).default(15),
@@ -21,7 +22,7 @@ const envSchema = z.object({
   // Optional: only needed for the webhook (Razorpay Dashboard → Webhooks)
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
   RAZORPAY_API_BASE: z.string().default('https://api.razorpay.com/v1'),
-  // Optional: Cloudinary stores profile photos and receipts (without it, receipts go in MongoDB)
+  // Optional: Cloudinary stores profile photos and receipts (without it, receipts are stored in PostgreSQL)
   CLOUDINARY_CLOUD_NAME: z.string().optional(),
   CLOUDINARY_API_KEY: z.string().optional(),
   CLOUDINARY_API_SECRET: z.string().optional(),

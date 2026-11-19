@@ -1,4 +1,4 @@
-import { FxRateModel } from "./fx.model";
+import { prisma } from "../../config/db";
 import { AppError } from "../../utils/AppError";
 import { logger } from "../../utils/logger";
 import { env } from "../../config/env";
@@ -36,7 +36,7 @@ export const fxService = {
   async rate(from: string, date = today()) {
     if (date > today()) date = today();
     const key = `${from}:${date}`;
-    const cached = await FxRateModel.findOne({ key }).lean();
+    const cached = await prisma.fxRate.findUnique({ where: { key } });
     const stale = cached && date === today() && Date.now() - cached.fetchedAt.getTime() > FRESH_FOR;
     if (cached && !stale) return shape(from, cached);
 
@@ -54,11 +54,8 @@ export const fxService = {
       throw new AppError(503, "Couldn't get the exchange rate. Type the rate in yourself.");
     }
     const rate = Math.round(found.rate * 1e6) / 1e6;
-    await FxRateModel.updateOne(
-      { key },
-      { $set: { rate, rateDate: found.rateDate, source: found.source, fetchedAt: new Date() } },
-      { upsert: true },
-    );
+    const row = { rate, rateDate: found.rateDate, source: found.source, fetchedAt: new Date() };
+    await prisma.fxRate.upsert({ where: { key }, create: { key, ...row }, update: row });
     return shape(from, { rate, rateDate: found.rateDate, source: found.source });
   },
 };

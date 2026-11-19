@@ -1,13 +1,11 @@
-import { Types } from "mongoose";
-import { ExpenseModel } from "../expense/expense.model";
-import { COUNTED, SettlementModel } from "../settlement/settlement.model";
-import { GroupDoc, GroupModel } from "../group/group.model";
-import { UserModel } from "../user/user.model";
+import { prisma } from "../../config/db";
+import { COUNTED } from "../settlement/settlement.model";
+import { GroupDoc } from "../group/group.model";
+import type { Db } from "../../utils/transaction";
 
-type Totals = { _id: Types.ObjectId; total: number }[];
 export type Payment = { from: string; to: string; amount: number };
 
-const toId = (id: Types.ObjectId | string) => (typeof id === "string" ? new Types.ObjectId(id) : id);
+const n = (v: number | bigint | null | undefined) => Number(v ?? 0);
 
 /**
  * Net balance per person in a group, in paise.
@@ -15,45 +13,24 @@ const toId = (id: Types.ObjectId | string) => (typeof id === "string" ? new Type
  *   net = paid for expenses − their shares + payments sent − payments received
  * The nets of a group always add up to exactly 0.
  */
-async function netBalances(groupId: Types.ObjectId | string): Promise<Map<string, number>> {
-  const gid = toId(groupId); // aggregate() doesn't cast strings, so pass a real ObjectId
+async function netBalances(groupId: string, db: Db = prisma): Promise<Map<string, number>> {
+  const live = { groupId, deletedAt: null };
+  const counted = { groupId, ...COUNTED };
 
-  const [[expenses], [payments]] = await Promise.all([
-    ExpenseModel.aggregate<{ paid: Totals; share: Totals }>([
-      { $match: { groupId: gid, deletedAt: null } },
-      {
-        $facet: {
-          paid: [{ $group: { _id: "$paidBy", total: { $sum: "$amount" } } }],
-          share: [
-            { $unwind: "$splits" },
-            { $group: { _id: "$splits.userId", total: { $sum: "$splits.amount" } } },
-          ],
-        },
-      },
-    ]),
-    SettlementModel.aggregate<{ sent: Totals; received: Totals }>([
-      // Only payments the receiver confirmed count
-      { $match: { groupId: gid, ...COUNTED } },
-      {
-        $facet: {
-          sent: [{ $group: { _id: "$from", total: { $sum: "$amount" } } }],
-          received: [{ $group: { _id: "$to", total: { $sum: "$amount" } } }],
-        },
-      },
-    ]),
+  const [paid, shares, sent, received] = await Promise.all([
+    db.expense.groupBy({ by: ["paidById"], where: live, _sum: { amount: true } }),
+    db.expenseSplit.groupBy({ by: ["userId"], where: { expense: live }, _sum: { amount: true } }),
+    // Only payments the receiver confirmed count
+    db.settlement.groupBy({ by: ["fromId"], where: counted, _sum: { amount: true } }),
+    db.settlement.groupBy({ by: ["toId"], where: counted, _sum: { amount: true } }),
   ]);
 
   const net = new Map<string, number>();
-  const add = (rows: Totals | undefined, sign: 1 | -1) => {
-    for (const r of rows ?? []) {
-      const id = String(r._id);
-      net.set(id, (net.get(id) ?? 0) + sign * r.total);
-    }
-  };
-  add(expenses?.paid, 1);
-  add(expenses?.share, -1);
-  add(payments?.sent, 1);
-  add(payments?.received, -1);
+  const add = (id: string, amount: number) => net.set(id, (net.get(id) ?? 0) + amount);
+  for (const r of paid) add(r.paidById, n(r._sum.amount));
+  for (const r of shares) add(r.userId, -n(r._sum.amount));
+  for (const r of sent) add(r.fromId, n(r._sum.amount));
+  for (const r of received) add(r.toId, -n(r._sum.amount));
   return net;
 }
 
@@ -83,28 +60,39 @@ export function simplifyDebts(net: Map<string, number>): Payment[] {
   return payments;
 }
 
+const personSelect = { id: true, name: true, upiId: true, placeholder: true, avatarUrl: true } as const;
+type PersonRow = { id: string; name: string; upiId: string | null; placeholder: boolean; avatarUrl: string | null };
+
 export const balanceService = {
   netBalances,
 
   /** One person's balance in one group (used to stop people leaving with a balance). */
-  async memberNet(groupId: Types.ObjectId | string, userId: string) {
+  async memberNet(groupId: string, userId: string) {
     return (await netBalances(groupId)).get(userId) ?? 0;
   },
 
   /** Everything the group page needs: balances, who should pay whom, pending payments, the kitty. */
   async forGroup(group: GroupDoc, meId: string) {
-    const net = await netBalances(group._id);
-    const memberIds = group.members.map((m) => String(m.userId));
+    const net = await netBalances(group.id);
+    const memberIds = group.members.map((m) => m.userId);
+
+    // Payments waiting for the receiver to confirm (they don't count yet)
+    const pendingDocs = await prisma.settlement.findMany({
+      where: { groupId: group.id, deletedAt: null, status: "pending" },
+      orderBy: { createdAt: "desc" },
+    });
+
     // Include anyone with a non-zero balance, even if no longer a member
     const ids = [...new Set([...memberIds, ...net.keys()])];
-    const users = await UserModel.find({ _id: { $in: ids } }, "name upiId placeholder avatar").lean();
-    const byId = new Map(users.map((u) => [String(u._id), u]));
+    const lookup = [...new Set([...ids, ...pendingDocs.flatMap((p) => [p.fromId, p.toId]), ...(group.kittyHolderId ? [group.kittyHolderId] : [])])];
+    const users: PersonRow[] = await prisma.user.findMany({ where: { id: { in: lookup } }, select: personSelect });
+    const byId = new Map(users.map((u) => [u.id, u]));
     const person = (id: string) => ({
       id,
       name: byId.get(id)?.name ?? "Former member",
       upiId: byId.get(id)?.upiId ?? null,
       placeholder: Boolean(byId.get(id)?.placeholder),
-      avatarUrl: byId.get(id)?.avatar?.url ?? null,
+      avatarUrl: byId.get(id)?.avatarUrl ?? null,
     });
 
     const balances = ids
@@ -114,46 +102,27 @@ export const balanceService = {
 
     const suggestions = simplifyDebts(net).map((p) => ({ from: person(p.from), to: person(p.to), amount: p.amount }));
 
-    // Payments waiting for the receiver to confirm (they don't count yet)
-    const pendingDocs = await SettlementModel.find({ groupId: group._id, deletedAt: null, status: "pending" })
-      .sort({ createdAt: -1 })
-      .lean();
-    for (const p of pendingDocs) {
-      for (const id of [String(p.from), String(p.to)]) {
-        if (!byId.has(id)) {
-          const u = await UserModel.findById(id, "name upiId placeholder avatar").lean();
-          if (u) byId.set(id, u);
-        }
-      }
-    }
     const pending = pendingDocs.map((p) => ({
-      id: String(p._id),
-      from: person(String(p.from)),
-      to: person(String(p.to)),
+      id: p.id,
+      from: person(p.fromId),
+      to: person(p.toId),
       amount: p.amount,
-      kind: p.kind ?? "payment",
+      kind: p.kind,
       note: p.note,
-      createdBy: String(p.createdBy),
+      createdBy: p.createdById,
       createdAt: p.createdAt,
     }));
 
     // Trip kitty: money put in (confirmed) vs. spent from it
     let kitty = null;
     if (group.kittyHolderId) {
-      const holderId = String(group.kittyHolderId);
-      const [[inRow], [outRow]] = await Promise.all([
-        SettlementModel.aggregate<{ total: number }>([
-          { $match: { groupId: group._id, kind: "kitty", ...COUNTED } },
-          { $group: { _id: null, total: { $sum: "$amount" } } },
-        ]),
-        ExpenseModel.aggregate<{ total: number }>([
-          { $match: { groupId: group._id, deletedAt: null, fromKitty: true } },
-          { $group: { _id: null, total: { $sum: "$amount" } } },
-        ]),
+      const [inRow, outRow] = await Promise.all([
+        prisma.settlement.aggregate({ where: { groupId: group.id, kind: "kitty", ...COUNTED }, _sum: { amount: true } }),
+        prisma.expense.aggregate({ where: { groupId: group.id, deletedAt: null, fromKitty: true }, _sum: { amount: true } }),
       ]);
-      const collected = inRow?.total ?? 0;
-      const spent = outRow?.total ?? 0;
-      kitty = { holder: person(holderId), collected, spent, remaining: collected - spent };
+      const collected = n(inRow._sum.amount);
+      const spent = n(outRow._sum.amount);
+      kitty = { holder: person(group.kittyHolderId), collected, spent, remaining: collected - spent };
     }
 
     return { balances, suggestions, pending, kitty, myNet: net.get(meId) ?? 0 };
@@ -161,64 +130,41 @@ export const balanceService = {
 
   /** Dashboard totals across every group I'm in. */
   async summaryFor(userId: string) {
-    const uid = toId(userId);
-    const groups = await GroupModel.find({ "members.userId": uid }, "_id").lean();
-    const groupIds = groups.map((g) => g._id);
+    const memberships = await prisma.groupMember.findMany({ where: { userId }, select: { groupId: true } });
+    const groupIds = memberships.map((g) => g.groupId);
 
-    const [expenseRows, paymentRows] = await Promise.all([
-      // For each group: what I paid minus my share, only from expenses I'm part of
-      ExpenseModel.aggregate<{ _id: Types.ObjectId; net: number }>([
-        {
-          $match: {
-            groupId: { $in: groupIds },
-            deletedAt: null,
-            $or: [{ paidBy: uid }, { "splits.userId": uid }],
-          },
-        },
-        {
-          $project: {
-            groupId: 1,
-            paid: { $cond: [{ $eq: ["$paidBy", uid] }, "$amount", 0] },
-            share: {
-              $sum: {
-                $map: {
-                  input: { $filter: { input: "$splits", cond: { $eq: ["$$this.userId", uid] } } },
-                  in: "$$this.amount",
-                },
-              },
-            },
-          },
-        },
-        { $group: { _id: "$groupId", net: { $sum: { $subtract: ["$paid", "$share"] } } } },
-      ]),
+    const [paidRows, shareRows, sentRows, gotRows] = await Promise.all([
+      // What I paid for expenses, per group
+      prisma.expense.groupBy({
+        by: ["groupId"],
+        where: { groupId: { in: groupIds }, deletedAt: null, paidById: userId },
+        _sum: { amount: true },
+      }),
+      // My shares of expenses, per group
+      groupIds.length
+        ? prisma.$queryRaw<{ groupId: string; total: bigint }[]>`
+            SELECT e."groupId", SUM(s.amount)::bigint AS total
+            FROM "ExpenseSplit" s JOIN "Expense" e ON e.id = s."expenseId"
+            WHERE s."userId" = ${userId} AND e."deletedAt" IS NULL AND e."groupId" = ANY(${groupIds})
+            GROUP BY e."groupId"`
+        : Promise.resolve([]),
       // Payments I sent count for me, payments I received count against
-      SettlementModel.aggregate<{ _id: Types.ObjectId; net: number }>([
-        {
-          $match: {
-            groupId: { $in: groupIds },
-            ...COUNTED,
-            $or: [{ from: uid }, { to: uid }],
-          },
-        },
-        {
-          $group: {
-            _id: "$groupId",
-            net: { $sum: { $cond: [{ $eq: ["$from", uid] }, "$amount", { $multiply: ["$amount", -1] }] } },
-          },
-        },
-      ]),
+      prisma.settlement.groupBy({ by: ["groupId"], where: { groupId: { in: groupIds }, ...COUNTED, fromId: userId }, _sum: { amount: true } }),
+      prisma.settlement.groupBy({ by: ["groupId"], where: { groupId: { in: groupIds }, ...COUNTED, toId: userId }, _sum: { amount: true } }),
     ]);
 
     const byGroup = new Map<string, number>();
-    for (const r of [...expenseRows, ...paymentRows]) {
-      byGroup.set(String(r._id), (byGroup.get(String(r._id)) ?? 0) + r.net);
-    }
+    const add = (id: string, amount: number) => byGroup.set(id, (byGroup.get(id) ?? 0) + amount);
+    for (const r of paidRows) add(r.groupId, n(r._sum.amount));
+    for (const r of shareRows) add(r.groupId, -n(r.total));
+    for (const r of sentRows) add(r.groupId, n(r._sum.amount));
+    for (const r of gotRows) add(r.groupId, -n(r._sum.amount));
 
     const nets = [...byGroup.values()];
     return {
-      owedToYou: nets.filter((n) => n > 0).reduce((a, b) => a + b, 0),
-      youOwe: -nets.filter((n) => n < 0).reduce((a, b) => a + b, 0),
-      groups: groupIds.map((id) => ({ groupId: String(id), net: byGroup.get(String(id)) ?? 0 })),
+      owedToYou: nets.filter((v) => v > 0).reduce((a, b) => a + b, 0),
+      youOwe: -nets.filter((v) => v < 0).reduce((a, b) => a + b, 0),
+      groups: groupIds.map((id) => ({ groupId: id, net: byGroup.get(id) ?? 0 })),
     };
   },
 };

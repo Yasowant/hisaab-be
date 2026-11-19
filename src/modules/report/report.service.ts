@@ -1,8 +1,4 @@
-import { Types } from "mongoose";
-import { ExpenseModel } from "../expense/expense.model";
-import { GroupModel } from "../group/group.model";
-
-type Row = { _id: unknown; total: number };
+import { prisma } from "../../config/db";
 
 /** First day of a "YYYY-MM" month and of the month after, in UTC (expense dates are UTC days). */
 function monthRange(month: string) {
@@ -10,65 +6,67 @@ function monthRange(month: string) {
   return { start: new Date(Date.UTC(y, m - 1, 1)), end: new Date(Date.UTC(y, m, 1)), prevStart: new Date(Date.UTC(y, m - 2, 1)) };
 }
 
+type MyExpense = {
+  id: string;
+  groupId: string;
+  description: string;
+  category: string;
+  date: Date;
+  amount: number;
+  paidById: string;
+  share: number;
+};
+
 export const reportService = {
   /**
    * What I personally spent in one month, across every group: my share of each
    * expense (not what I paid up front, which others may owe me back).
    */
   async monthly(userId: string, month: string) {
-    const me = new Types.ObjectId(userId);
     const { start, end, prevStart } = monthRange(month);
 
-    const [facets] = await ExpenseModel.aggregate<{
-      totals: { total: number; count: number }[];
-      byCategory: Row[];
-      byGroup: Row[];
-      byDay: Row[];
-      top: { _id: Types.ObjectId; description: string; groupId: Types.ObjectId; date: Date; amount: number; share: number }[];
-      paid: { total: number }[];
-    }>([
-      { $match: { deletedAt: null, "splits.userId": me, date: { $gte: start, $lt: end } } },
-      { $set: { share: { $sum: { $map: { input: { $filter: { input: "$splits", cond: { $eq: ["$$this.userId", me] } } }, in: "$$this.amount" } } } } },
-      {
-        $facet: {
-          totals: [{ $group: { _id: null, total: { $sum: "$share" }, count: { $sum: 1 } } }],
-          byCategory: [{ $group: { _id: "$category", total: { $sum: "$share" } } }, { $sort: { total: -1 } }],
-          byGroup: [{ $group: { _id: "$groupId", total: { $sum: "$share" } } }, { $sort: { total: -1 } }],
-          byDay: [{ $group: { _id: { $dayOfMonth: "$date" }, total: { $sum: "$share" } } }, { $sort: { _id: 1 } }],
-          top: [{ $sort: { share: -1, date: -1 } }, { $limit: 5 }, { $project: { description: 1, groupId: 1, date: 1, amount: 1, share: 1 } }],
-          paid: [{ $match: { paidBy: me } }, { $group: { _id: null, total: { $sum: "$amount" } } }],
-        },
-      },
+    // Every expense I have a share in this month, with my share. Small enough to total up here.
+    const [rows, [prev]] = await Promise.all([
+      prisma.$queryRaw<MyExpense[]>`
+        SELECT e.id, e."groupId", e.description, e.category::text AS category, e.date, e.amount, e."paidById", s.amount AS share
+        FROM "Expense" e JOIN "ExpenseSplit" s ON s."expenseId" = e.id AND s."userId" = ${userId}
+        WHERE e."deletedAt" IS NULL AND e.date >= ${start} AND e.date < ${end}`,
+      prisma.$queryRaw<{ total: bigint | null }[]>`
+        SELECT SUM(s.amount)::bigint AS total
+        FROM "Expense" e JOIN "ExpenseSplit" s ON s."expenseId" = e.id AND s."userId" = ${userId}
+        WHERE e."deletedAt" IS NULL AND e.date >= ${prevStart} AND e.date < ${start}`,
     ]);
 
-    const [prev] = await ExpenseModel.aggregate<{ total: number }>([
-      { $match: { deletedAt: null, "splits.userId": me, date: { $gte: prevStart, $lt: start } } },
-      { $unwind: "$splits" },
-      { $match: { "splits.userId": me } },
-      { $group: { _id: null, total: { $sum: "$splits.amount" } } },
-    ]);
+    const totalBy = <K>(key: (r: MyExpense) => K) => {
+      const m = new Map<K, number>();
+      for (const r of rows) m.set(key(r), (m.get(key(r)) ?? 0) + r.share);
+      return [...m].map(([k, total]) => ({ key: k, total })).sort((a, b) => b.total - a.total);
+    };
+    const byCategory = totalBy((r) => r.category);
+    const byGroup = totalBy((r) => r.groupId);
+    const perDay = new Map(totalBy((r) => r.date.getUTCDate()).map((d) => [d.key, d.total]));
+    const top = [...rows].sort((a, b) => b.share - a.share || b.date.getTime() - a.date.getTime()).slice(0, 5);
 
-    const groupIds = [...(facets?.byGroup ?? []).map((g) => g._id), ...(facets?.top ?? []).map((t) => t.groupId)];
-    const groups = await GroupModel.find({ _id: { $in: groupIds } }, "name").lean();
-    const nameOf = new Map(groups.map((g) => [String(g._id), g.name]));
-    const groupName = (id: unknown) => nameOf.get(String(id)) ?? "A group you left";
+    const groupIds = [...new Set([...byGroup.map((g) => g.key), ...top.map((t) => t.groupId)])];
+    const groups = await prisma.group.findMany({ where: { id: { in: groupIds } }, select: { id: true, name: true } });
+    const nameOf = new Map(groups.map((g) => [g.id, g.name]));
+    const groupName = (id: string) => nameOf.get(id) ?? "A group you left";
 
     const daysInMonth = Math.round((end.getTime() - start.getTime()) / 86_400_000);
-    const perDay = new Map((facets?.byDay ?? []).map((d) => [Number(d._id), d.total]));
 
     return {
       month,
-      total: facets?.totals[0]?.total ?? 0,
-      count: facets?.totals[0]?.count ?? 0,
-      paidUpFront: facets?.paid[0]?.total ?? 0,
-      previousTotal: prev?.total ?? 0,
-      byCategory: (facets?.byCategory ?? []).map((c) => ({ category: String(c._id), total: c.total })),
-      byGroup: (facets?.byGroup ?? []).map((g) => ({ groupId: String(g._id), name: groupName(g._id), total: g.total })),
+      total: rows.reduce((t, r) => t + r.share, 0),
+      count: rows.length,
+      paidUpFront: rows.filter((r) => r.paidById === userId).reduce((t, r) => t + r.amount, 0),
+      previousTotal: Number(prev?.total ?? 0),
+      byCategory: byCategory.map((c) => ({ category: c.key, total: c.total })),
+      byGroup: byGroup.map((g) => ({ groupId: g.key, name: groupName(g.key), total: g.total })),
       byDay: Array.from({ length: daysInMonth }, (_, i) => ({ day: i + 1, total: perDay.get(i + 1) ?? 0 })),
-      top: (facets?.top ?? []).map((t) => ({
-        id: String(t._id),
+      top: top.map((t) => ({
+        id: t.id,
         description: t.description,
-        groupId: String(t.groupId),
+        groupId: t.groupId,
         groupName: groupName(t.groupId),
         date: t.date,
         amount: t.amount,

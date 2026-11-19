@@ -1,8 +1,8 @@
-import { Types } from "mongoose";
-import { ReminderModel } from "./reminder.model";
-import { GroupDoc, GroupModel } from "../group/group.model";
+import { prisma } from "../../config/db";
+import { GroupDoc, membersInclude } from "../group/group.model";
 import { balanceService, simplifyDebts } from "../balance/balance.service";
 import { notificationService } from "../notification/notification.service";
+import { NOTIFICATION_TTL_MS } from "../notification/notification.model";
 import { AppError } from "../../utils/AppError";
 import { logger } from "../../utils/logger";
 import { env } from "../../config/env";
@@ -12,47 +12,58 @@ const AUTO_EVERY = 2 * DAY; // scheduled reminders: at most every 2 days per per
 const MANUAL_EVERY = 20 * 60 * 60 * 1000; // a friend's "Remind" button: once a day
 const START_BEFORE = 3 * DAY; // start reminding 3 days before the settle-by date
 
-const isDuplicateKey = (err: unknown) => (err as { code?: number })?.code === 11000;
 const dayFmt = new Intl.DateTimeFormat("en-IN", { day: "numeric", month: "short", timeZone: "UTC" });
 
 /**
- * Claim the right to remind this person now. One atomic write: if someone (or
- * another server) reminded them recently, this returns false and nothing is sent.
+ * Claim the right to remind this person now. One atomic statement: if someone
+ * (or another server) reminded them recently, this returns false and nothing is sent.
  */
-async function claim(groupId: Types.ObjectId, userId: string, every: number) {
+async function claim(groupId: string, userId: string, every: number) {
   const now = new Date();
-  try {
-    const doc = await ReminderModel.findOneAndUpdate(
-      { groupId, userId, lastSentAt: { $lte: new Date(now.getTime() - every) } },
-      { $set: { lastSentAt: now } },
-      { upsert: true, returnDocument: "after" },
-    );
-    return Boolean(doc);
-  } catch (err) {
-    if (isDuplicateKey(err)) return false; // a recent reminder already exists
-    throw err;
-  }
+  const cutoff = new Date(now.getTime() - every);
+  const rows = await prisma.$queryRaw<{ id: string }[]>`
+    INSERT INTO "Reminder" (id, "groupId", "userId", "lastSentAt")
+    VALUES (hisaab_id(), ${groupId}, ${userId}, ${now})
+    ON CONFLICT ("groupId", "userId") DO UPDATE SET "lastSentAt" = EXCLUDED."lastSentAt"
+    WHERE "Reminder"."lastSentAt" <= ${cutoff}
+    RETURNING id`;
+  return rows.length > 0;
 }
 
 /** Who each person owes, from the group's suggested payments. */
-async function debts(group: GroupDoc) {
-  return simplifyDebts(await balanceService.netBalances(group._id));
+async function debts(group: { id: string }) {
+  return simplifyDebts(await balanceService.netBalances(group.id));
+}
+
+/** MongoDB used to expire these on its own; now the sweep removes them. */
+async function cleanUp() {
+  const now = new Date();
+  const [sessions, resets, notifications] = await Promise.all([
+    prisma.session.deleteMany({ where: { expiresAt: { lt: now } } }),
+    prisma.passwordReset.deleteMany({ where: { expiresAt: { lt: now } } }),
+    prisma.notification.deleteMany({ where: { createdAt: { lt: new Date(now.getTime() - NOTIFICATION_TTL_MS) } } }),
+  ]);
+  const removed = sessions.count + resets.count + notifications.count;
+  if (removed) logger.info({ sessions: sessions.count, resets: resets.count, notifications: notifications.count }, "Old rows cleaned up");
 }
 
 export const reminderService = {
   /** The scheduled check: groups with a settle-by date that's near or past. */
   async sweep() {
     const now = Date.now();
-    const groups = await GroupModel.find({ closedAt: null, settleBy: { $ne: null, $lte: new Date(now + START_BEFORE) } });
+    const groups = await prisma.group.findMany({
+      where: { closedAt: null, settleBy: { not: null, lte: new Date(now + START_BEFORE) } },
+      include: membersInclude,
+    });
     let sent = 0;
     for (const g of groups) {
       const by = g.settleBy!;
       const overdue = by.getTime() < now - DAY;
       for (const p of await debts(g)) {
-        if (!(await claim(g._id, p.from, AUTO_EVERY))) continue;
+        if (!(await claim(g.id, p.from, AUTO_EVERY))) continue;
         await notificationService.notify({
           recipients: [p.from],
-          groupId: g._id,
+          groupId: g.id,
           actor: p.to, // shown as "you owe <them>"
           type: "payment_reminder",
           data: {
@@ -66,6 +77,7 @@ export const reminderService = {
       }
     }
     if (sent) logger.info({ sent }, "Payment reminders sent");
+    await cleanUp();
     return sent;
   },
 
@@ -76,12 +88,12 @@ export const reminderService = {
     const mine = owed.find((p) => p.to === actorId);
     if (!mine && role !== "admin") throw new AppError(403, "You can remind people who owe you");
     const target = mine ?? owed[0]!;
-    if (!(await claim(group._id, debtorId, MANUAL_EVERY))) {
+    if (!(await claim(group.id, debtorId, MANUAL_EVERY))) {
       throw new AppError(429, "They were reminded recently. Try again tomorrow.");
     }
     await notificationService.notify({
       recipients: [debtorId],
-      groupId: group._id,
+      groupId: group.id,
       actor: target.to,
       type: "payment_reminder",
       data: { amount: target.amount, text: `${mine ? "They" : "An admin"} sent you a reminder.` },

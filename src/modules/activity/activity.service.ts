@@ -1,59 +1,73 @@
-import { ClientSession, Types } from "mongoose";
-import { ActivityModel, ACTIVITY_TYPES } from "./activity.model";
+import { prisma } from "../../config/db";
+import { ActivityData, ActivityType } from "./activity.model";
 import { GroupDoc } from "../group/group.model";
 import { notificationService } from "../notification/notification.service";
+import type { Tx } from "../../utils/transaction";
 
-type ActivityType = (typeof ACTIVITY_TYPES)[number];
-type Named = { _id: Types.ObjectId; name: string };
+export type ActivityEntry = {
+  groupId: string;
+  actor: string;
+  type: ActivityType;
+  data: ActivityData & { from?: string; to?: string };
+};
 
 export const activityService = {
   /** Always called inside the same transaction as the change it describes. */
-  async record(
-    session: ClientSession,
-    entry: {
-      groupId: Types.ObjectId | string;
-      actor: string;
-      type: ActivityType;
-      data: Record<string, unknown>;
-    },
-  ) {
-    await ActivityModel.create([entry], { session });
+  async record(tx: Tx, entry: ActivityEntry) {
+    const { from, to, ...data } = entry.data;
+    await tx.activity.create({
+      data: {
+        groupId: entry.groupId,
+        actorId: entry.actor,
+        type: entry.type,
+        fromId: from ?? null,
+        toId: to ?? null,
+        data: stripUndefined(data),
+      },
+    });
     // Tell the people it concerns (same transaction: no change without its notifications)
-    await notificationService.fromActivity(session, entry);
+    await notificationService.fromActivity(tx, entry);
   },
 
   async list(group: GroupDoc, page: number, limit: number) {
-    const filter = { groupId: group._id };
+    const where = { groupId: group.id };
     const [docs, total] = await Promise.all([
-      ActivityModel.find(filter)
-        .sort({ createdAt: -1, _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .populate<{ actor: Named }>("actor", "name")
-        .populate<{
-          data: { description?: string; amount?: number; previousAmount?: number; text?: string; from?: Named; to?: Named };
-        }>([
-          { path: "data.from", select: "name" },
-          { path: "data.to", select: "name" },
-        ])
-        .lean(),
-      ActivityModel.countDocuments(filter),
+      prisma.activity.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: (page - 1) * limit,
+        take: limit,
+        include: {
+          actor: { select: { id: true, name: true } },
+          from: { select: { id: true, name: true } },
+          to: { select: { id: true, name: true } },
+        },
+      }),
+      prisma.activity.count({ where }),
     ]);
 
     return {
-      items: docs.map((a) => ({
-        id: String(a._id),
-        type: a.type,
-        actor: { id: String(a.actor._id), name: a.actor.name },
-        description: a.data?.description ?? null,
-        amount: a.data?.amount ?? null,
-        previousAmount: a.data?.previousAmount ?? null,
-        text: a.data?.text ?? null,
-        from: a.data?.from ? { id: String(a.data.from._id), name: a.data.from.name } : null,
-        to: a.data?.to ? { id: String(a.data.to._id), name: a.data.to.name } : null,
-        createdAt: a.createdAt,
-      })),
+      items: docs.map((a) => {
+        const d = (a.data ?? {}) as ActivityData;
+        return {
+          id: a.id,
+          type: a.type,
+          actor: { id: a.actor.id, name: a.actor.name },
+          description: d.description ?? null,
+          amount: d.amount ?? null,
+          previousAmount: d.previousAmount ?? null,
+          text: d.text ?? null,
+          from: a.from ? { id: a.from.id, name: a.from.name } : null,
+          to: a.to ? { id: a.to.id, name: a.to.name } : null,
+          createdAt: a.createdAt,
+        };
+      }),
       meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
     };
   },
 };
+
+/** JSON columns can't hold `undefined`; drop those keys. */
+export function stripUndefined<T extends Record<string, unknown>>(o: T): T {
+  return Object.fromEntries(Object.entries(o).filter(([, v]) => v !== undefined)) as T;
+}

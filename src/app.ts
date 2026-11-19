@@ -2,9 +2,9 @@ import express from "express";
 import helmet from "helmet";
 import cors from "cors";
 import { pinoHttp } from "pino-http";
-import mongoose from "mongoose";
 
 import { env } from "./config/env";
+import { dbIsUp } from "./config/db";
 import { logger } from "./utils/logger";
 import { notFound } from "./middlewares/notFound";
 import { errorHandler } from "./middlewares/errorHandler";
@@ -30,8 +30,8 @@ app.use(cookieParser());
 app.use(pinoHttp({ logger }));
 
 // Health check: shows server + DB status
-app.get("/health", (_req, res) => {
-  const dbUp = mongoose.connection.readyState === 1;
+app.get("/health", async (_req, res) => {
+  const dbUp = await dbIsUp();
   res.status(dbUp ? 200 : 503).json({
     status: dbUp ? "ok" : "degraded",
     db: dbUp ? "connected" : "disconnected",

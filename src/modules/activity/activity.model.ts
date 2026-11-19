@@ -1,4 +1,4 @@
-import { Schema, model, Types, InferSchemaType } from "mongoose";
+// The table lives in prisma/schema.prisma (Activity); this file keeps the shared constants.
 
 export const ACTIVITY_TYPES = [
   "expense_added",
@@ -13,27 +13,14 @@ export const ACTIVITY_TYPES = [
   "dispute_resolved",
 ] as const;
 
-const activitySchema = new Schema(
-  {
-    groupId: { type: Types.ObjectId, ref: "Group", required: true },
-    actor: { type: Types.ObjectId, ref: "User", required: true }, // who did it
-    type: { type: String, enum: ACTIVITY_TYPES, required: true },
-    // A snapshot of what it was about, so the feed still reads right after later edits
-    data: {
-      description: String,
-      amount: Number, // paise
-      previousAmount: Number, // paise, for edits
-      text: String, // dispute reason
-      from: { type: Types.ObjectId, ref: "User" },
-      to: { type: Types.ObjectId, ref: "User" },
-      expenseId: { type: Types.ObjectId, ref: "Expense" },
-      settlementId: { type: Types.ObjectId, ref: "Settlement" },
-    },
-  },
-  { timestamps: { createdAt: true, updatedAt: false }, versionKey: false },
-);
+export type ActivityType = (typeof ACTIVITY_TYPES)[number];
 
-activitySchema.index({ groupId: 1, createdAt: -1 });
-
-export type Activity = InferSchemaType<typeof activitySchema>;
-export const ActivityModel = model("Activity", activitySchema);
+/** What Activity.data holds: a snapshot of what it was about. */
+export type ActivityData = {
+  description?: string;
+  amount?: number; // paise
+  previousAmount?: number; // paise, for edits
+  text?: string; // dispute reason
+  expenseId?: string;
+  settlementId?: string;
+};

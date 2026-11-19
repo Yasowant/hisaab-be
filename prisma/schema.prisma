@@ -1,0 +1,464 @@
+// Hisaab database schema (PostgreSQL)
+//
+// Ids are 24-character hex strings, the same shape as the old MongoDB ObjectIds:
+// time-ordered (first 8 characters = seconds since 1970) so "newest first" can sort
+// by id, and existing frontend checks for /^[a-f\d]{24}$/ keep working.
+// The database makes them with hisaab_id() (defined in the first migration);
+// the app can also make one ahead of time with newId() (src/utils/id.ts).
+//
+// Money is always whole paise in Int columns.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------- Enums ----------
+
+enum GroupType {
+  trip
+  home
+  other
+}
+
+enum MemberRole {
+  admin
+  member
+}
+
+enum SplitType {
+  equal
+  exact
+  percent
+  itemized
+}
+
+enum Category {
+  food
+  travel
+  stay
+  rent
+  utilities
+  shopping
+  other
+}
+
+enum SettlementStatus {
+  pending   // recorded by the payer (or an admin), waiting for the receiver
+  confirmed // counts towards balances
+  rejected  // the receiver said it never arrived; ignored
+}
+
+enum SettlementKind {
+  payment
+  kitty // money put into the group's trip kitty (paid to the kitty holder)
+}
+
+enum PaymentOrderStatus {
+  created
+  paid
+}
+
+enum Frequency {
+  weekly
+  monthly
+}
+
+enum ReceiptProvider {
+  database   // the file's bytes are in this table (when Cloudinary isn't set up)
+  cloudinary // private file on Cloudinary
+}
+
+enum ActivityType {
+  expense_added
+  expense_updated
+  expense_deleted
+  payment_recorded
+  payment_deleted
+  payment_confirmed
+  payment_rejected
+  member_claimed
+  expense_disputed
+  dispute_resolved
+}
+
+enum NotificationType {
+  expense_added
+  expense_updated
+  expense_deleted
+  payment_to_confirm
+  payment_received
+  payment_confirmed
+  payment_rejected
+  comment_added
+  expense_disputed
+  dispute_resolved
+  payment_reminder
+}
+
+// ---------- Users & sign-in ----------
+
+model User {
+  id                 String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  name               String    @db.VarChar(50)
+  email              String    @unique
+  password           String // bcrypt hash
+  // UPI ID like "name@okaxis", shown to group members so they can pay you
+  upiId              String?   @db.VarChar(100)
+  // Profile photo on Cloudinary (url is already cropped to a small square)
+  avatarUrl          String?
+  avatarPublicId     String?
+  // Emails about payments and flagged expenses (password emails always go out)
+  emailNotifications Boolean   @default(true)
+  // A "member not on Hisaab yet": added by name, claimed later by a real account
+  placeholder        Boolean   @default(false)
+  // Set when the account is deleted; the row stays so old expenses keep a name
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  sessions        Session[]
+  passwordResets  PasswordReset[]
+  memberships     GroupMember[]
+  groupsCreated   Group[]         @relation("GroupCreatedBy")
+  groupsKitty     Group[]         @relation("GroupKittyHolder")
+  groupsClosed    Group[]         @relation("GroupClosedBy")
+  expensesPaid    Expense[]       @relation("ExpensePaidBy")
+  expensesCreated Expense[]       @relation("ExpenseCreatedBy")
+  expensesFlagged Expense[]       @relation("ExpenseDisputeBy")
+  splits          ExpenseSplit[]
+  receipts        ExpenseReceipt[]
+  paymentsSent    Settlement[]    @relation("SettlementFrom")
+  paymentsGot     Settlement[]    @relation("SettlementTo")
+  paymentsMade    Settlement[]    @relation("SettlementCreatedBy")
+  ordersFrom      PaymentOrder[]  @relation("OrderFrom")
+  ordersTo        PaymentOrder[]  @relation("OrderTo")
+  activityDone    Activity[]      @relation("ActivityActor")
+  activityFrom    Activity[]      @relation("ActivityFrom")
+  activityTo      Activity[]      @relation("ActivityTo")
+  notifications   Notification[]  @relation("NotificationUser")
+  notified        Notification[]  @relation("NotificationActor")
+  comments        Comment[]
+  reminders       Reminder[]
+  repeats         RecurringExpense[]
+}
+
+model Session {
+  id        String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  userId    String    @db.VarChar(24)
+  user      User      @relation(fields: [userId], references: [id])
+  familyId  String
+  tokenHash String    @unique
+  expiresAt DateTime // expired rows are cleaned up by the scheduled sweep
+  revokedAt DateTime?
+  userAgent String    @default("")
+  ip        String    @default("")
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+}
+
+model PasswordReset {
+  id        String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  userId    String    @db.VarChar(24)
+  user      User      @relation(fields: [userId], references: [id])
+  tokenHash String    @unique // SHA-256 of the emailed token
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// ---------- Groups ----------
+
+model Group {
+  id            String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  name          String    @db.VarChar(60)
+  type          GroupType @default(other)
+  inviteCode    String    @unique
+  createdById   String    @db.VarChar(24)
+  createdBy     User      @relation("GroupCreatedBy", fields: [createdById], references: [id])
+  // Optional spending budget for the whole group, in paise
+  budget        Int?
+  // Trip kitty: the member holding the shared pot (null = no kitty)
+  kittyHolderId String?   @db.VarChar(24)
+  kittyHolder   User?     @relation("GroupKittyHolder", fields: [kittyHolderId], references: [id])
+  // Everyone should be settled by this day; Hisaab reminds people who still owe
+  settleBy      DateTime?
+  // A finished trip: nothing can be added or changed until an admin reopens it
+  closedAt      DateTime?
+  closedById    String?   @db.VarChar(24)
+  closedBy      User?     @relation("GroupClosedBy", fields: [closedById], references: [id])
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  members       GroupMember[]
+  expenses      Expense[]
+  settlements   Settlement[]
+  orders        PaymentOrder[]
+  activity      Activity[]
+  notifications Notification[]
+  comments      Comment[]
+  reminders     Reminder[]
+  repeats       RecurringExpense[]
+
+  @@index([settleBy])
+}
+
+model GroupMember {
+  groupId  String     @db.VarChar(24)
+  group    Group      @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId   String     @db.VarChar(24)
+  user     User       @relation(fields: [userId], references: [id])
+  role     MemberRole @default(member)
+  joinedAt DateTime   @default(now())
+
+  @@id([groupId, userId])
+  // "Which groups am I in?" is the most common query
+  @@index([userId])
+}
+
+// ---------- Expenses ----------
+
+model Expense {
+  id          String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId     String    @db.VarChar(24)
+  group       Group     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  description String    @db.VarChar(100)
+  amount      Int // paise
+  paidById    String    @db.VarChar(24)
+  paidBy      User      @relation("ExpensePaidBy", fields: [paidById], references: [id])
+  splitType   SplitType
+  category    Category  @default(other)
+  date        DateTime
+  createdById String    @db.VarChar(24)
+  createdBy   User      @relation("ExpenseCreatedBy", fields: [createdById], references: [id])
+  deletedAt   DateTime?
+  // Itemized bills keep their lines: [{ name, amount, sharedBy: [userId] }]
+  items       Json?
+  // Tax, service and tip on an itemized bill, shared in proportion (paise)
+  extras      Int?
+  // Paid out of the trip kitty (paidBy is then the kitty holder)
+  fromKitty   Boolean   @default(false)
+  // Paid in another currency: { currency, amount (hundredths), rate (rupees per unit) }
+  original    Json?
+  // Created automatically by a repeating expense
+  recurringId String?   @db.VarChar(24)
+  recurring   RecurringExpense? @relation(fields: [recurringId], references: [id])
+  // "Something's wrong": a member flagged it; cleared when it's fixed or explained
+  disputeById String?   @db.VarChar(24)
+  disputeBy   User?     @relation("ExpenseDisputeBy", fields: [disputeById], references: [id])
+  disputeReason String? @db.VarChar(300)
+  disputeAt   DateTime?
+  // Goes up on every change: an edit only saves if nobody else saved first
+  version     Int       @default(0)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  splits   ExpenseSplit[]
+  receipt  ExpenseReceipt?
+  comments Comment[]
+
+  @@index([groupId, deletedAt, date(sort: Desc), id(sort: Desc)])
+  @@index([recurringId])
+}
+
+/** What each person owes for one expense. */
+model ExpenseSplit {
+  expenseId String  @db.VarChar(24)
+  expense   Expense @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  userId    String  @db.VarChar(24)
+  user      User    @relation(fields: [userId], references: [id])
+  amount    Int // paise
+  percent   Float? // only for percent splits
+  position  Int     @default(0) // keeps the order people were listed in
+
+  @@id([expenseId, userId])
+  @@index([userId])
+}
+
+/** Photo or PDF of the bill: on Cloudinary (private), or its bytes right here. */
+model ExpenseReceipt {
+  expenseId   String          @id @db.VarChar(24)
+  expense     Expense         @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  provider    ReceiptProvider
+  data        Bytes? // the file itself, when provider = database
+  publicId    String? // Cloudinary
+  format      String? // jpg, png, pdf…
+  contentType String
+  size        Int
+  byId        String          @db.VarChar(24)
+  by          User            @relation(fields: [byId], references: [id])
+  at          DateTime
+}
+
+/** A short note on an expense: "this included Rohan's drinks". */
+model Comment {
+  id        String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId   String    @db.VarChar(24)
+  group     Group     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  expenseId String    @db.VarChar(24)
+  expense   Expense   @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  userId    String    @db.VarChar(24)
+  user      User      @relation(fields: [userId], references: [id])
+  text      String    @db.VarChar(500)
+  deletedAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  @@index([expenseId, deletedAt, createdAt])
+}
+
+/** "Rent ₹30,000 every month": a saved expense that adds itself again on schedule. */
+model RecurringExpense {
+  id          String    @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId     String    @db.VarChar(24)
+  group       Group     @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  createdById String    @db.VarChar(24)
+  createdBy   User      @relation(fields: [createdById], references: [id])
+  // The expense request as it was first sent (without the date)
+  template    Json
+  frequency   Frequency
+  // Day of the month for monthly repeats (31 → last day in shorter months)
+  anchorDay   Int
+  nextRun     DateTime
+  active      Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  expenses Expense[]
+
+  @@index([groupId, active, nextRun])
+}
+
+// ---------- Payments ----------
+
+model Settlement {
+  id               String           @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId          String           @db.VarChar(24)
+  group            Group            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  fromId           String           @db.VarChar(24) // who paid
+  from             User             @relation("SettlementFrom", fields: [fromId], references: [id])
+  toId             String           @db.VarChar(24) // who received
+  to               User             @relation("SettlementTo", fields: [toId], references: [id])
+  amount           Int // paise
+  note             String           @default("") @db.VarChar(140)
+  date             DateTime
+  createdById      String           @db.VarChar(24)
+  createdBy        User             @relation("SettlementCreatedBy", fields: [createdById], references: [id])
+  // From the Idempotency-Key header: the same click sent twice saves once
+  idempotencyKey   String
+  deletedAt        DateTime?
+  status           SettlementStatus @default(confirmed)
+  respondedAt      DateTime?
+  kind             SettlementKind   @default(payment)
+  // Set when paid online through Razorpay: the money really moved, so it can't be undone here
+  gatewayPaymentId String?
+  // Payments made together from the Friends page share one id, so they're confirmed together
+  batchId          String?          @db.VarChar(24)
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  orders PaymentOrder[]
+
+  // Keys only need to be unique per person, so one user can't block another's key
+  @@unique([createdById, idempotencyKey])
+  @@index([groupId, deletedAt, createdAt(sort: Desc)])
+  @@index([groupId, status])
+  @@index([fromId])
+  @@index([toId])
+  @@index([batchId])
+}
+
+/** One "Pay online" attempt: a Razorpay order. When it's paid it becomes a confirmed settlement. */
+model PaymentOrder {
+  id           String             @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId      String             @db.VarChar(24)
+  group        Group              @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  fromId       String             @db.VarChar(24) // who pays
+  from         User               @relation("OrderFrom", fields: [fromId], references: [id])
+  toId         String             @db.VarChar(24) // who it's for
+  to           User               @relation("OrderTo", fields: [toId], references: [id])
+  amount       Int // paise (Razorpay's minimum is ₹1)
+  orderId      String             @unique // Razorpay order_…
+  status       PaymentOrderStatus @default(created)
+  paymentId    String? // Razorpay pay_…
+  settlementId String?            @db.VarChar(24)
+  settlement   Settlement?        @relation(fields: [settlementId], references: [id])
+  paidAt       DateTime?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+}
+
+// ---------- Feed, inbox, reminders ----------
+
+model Activity {
+  id        String       @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId   String       @db.VarChar(24)
+  group     Group        @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  actorId   String       @db.VarChar(24) // who did it
+  actor     User         @relation("ActivityActor", fields: [actorId], references: [id])
+  type      ActivityType
+  // People it was about (payments, claims, resolved disputes)
+  fromId    String?      @db.VarChar(24)
+  from      User?        @relation("ActivityFrom", fields: [fromId], references: [id])
+  toId      String?      @db.VarChar(24)
+  to        User?        @relation("ActivityTo", fields: [toId], references: [id])
+  // A snapshot: { description, amount, previousAmount, text, expenseId, settlementId }
+  data      Json         @default("{}")
+  createdAt DateTime     @default(now())
+
+  @@index([groupId, createdAt(sort: Desc)])
+}
+
+/** One line in a person's inbox. Older than 90 days are cleaned up by the scheduled sweep. */
+model Notification {
+  id        String           @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  userId    String           @db.VarChar(24) // who it's for
+  user      User             @relation("NotificationUser", fields: [userId], references: [id])
+  groupId   String           @db.VarChar(24)
+  group     Group            @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  actorId   String           @db.VarChar(24) // who did it
+  actor     User             @relation("NotificationActor", fields: [actorId], references: [id])
+  type      NotificationType
+  // A snapshot: { groupName, description, amount, text, expenseId }
+  data      Json             @default("{}")
+  readAt    DateTime?
+  createdAt DateTime         @default(now())
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, readAt])
+  @@index([createdAt])
+}
+
+/** When someone was last reminded about a group, so nobody is reminded too often. */
+model Reminder {
+  id         String   @id @default(dbgenerated("hisaab_id()")) @db.VarChar(24)
+  groupId    String   @db.VarChar(24)
+  group      Group    @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  userId     String   @db.VarChar(24) // the person who owes
+  user       User     @relation(fields: [userId], references: [id])
+  lastSentAt DateTime
+
+  @@unique([groupId, userId])
+}
+
+/** Exchange rates already looked up: "THB:2026-11-02" → rupees per baht. */
+model FxRate {
+  key       String   @id
+  rate      Float
+  rateDate  String // the day the rate is for (weekends use Friday's)
+  source    String
+  fetchedAt DateTime
+}

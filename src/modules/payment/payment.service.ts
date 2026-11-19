@@ -1,18 +1,14 @@
-import { Types } from "mongoose";
-import { PaymentOrderModel } from "./payment.model";
-import { SettlementModel } from "../settlement/settlement.model";
+import { prisma } from "../../config/db";
 import { GroupDoc } from "../group/group.model";
-import { UserModel } from "../user/user.model";
 import { activityService } from "../activity/activity.service";
 import { publish } from "../events/events";
 import { AppError } from "../../utils/AppError";
 import { inTransaction } from "../../utils/transaction";
+import { isUniqueViolation } from "../../utils/dbErrors";
+import { newId } from "../../utils/id";
 import { logger } from "../../utils/logger";
 import { env } from "../../config/env";
 import { checkoutSignatureValid, razorpay, razorpayEnabled, type RzpPayment } from "../../utils/razorpay";
-
-const isDuplicateKey = (err: unknown) =>
-  typeof err === "object" && err !== null && (err as { code?: number }).code === 11000;
 
 /**
  * Turn a paid order into a confirmed payment, exactly once. Both the browser
@@ -20,55 +16,52 @@ const isDuplicateKey = (err: unknown) =>
  * first records it, the other finds it already done.
  */
 async function settle(orderId: string, paymentId: string) {
-  const order = await PaymentOrderModel.findOne({ orderId });
+  const order = await prisma.paymentOrder.findUnique({ where: { orderId } });
   if (!order) throw new AppError(404, "Payment not found");
   if (order.status === "paid") return { order, alreadyDone: true };
 
   try {
-    await inTransaction(async (session) => {
-      const claimed = await PaymentOrderModel.findOneAndUpdate(
-        { _id: order._id, status: "created" },
-        { $set: { status: "paid", paymentId, paidAt: new Date() } },
-        { session, returnDocument: "after" },
-      );
-      if (!claimed) throw new AppError(409, "already paid");
+    await inTransaction(async (tx) => {
+      const claimed = await tx.paymentOrder.updateMany({
+        where: { id: order.id, status: "created" },
+        data: { status: "paid", paymentId, paidAt: new Date() },
+      });
+      if (claimed.count === 0) throw new AppError(409, "already paid");
 
-      const [s] = await SettlementModel.create(
-        [
-          {
-            groupId: order.groupId,
-            from: order.from,
-            to: order.to,
-            amount: order.amount,
-            note: "Paid online",
-            date: new Date(),
-            createdBy: order.from,
-            idempotencyKey: `rzp:${orderId}`,
-            status: "confirmed", // the gateway confirmed it; nobody needs to
-            kind: "payment",
-            gatewayPaymentId: paymentId,
-          },
-        ],
-        { session },
-      );
-      await PaymentOrderModel.updateOne({ _id: order._id }, { $set: { settlementId: s!._id } }, { session });
-      await activityService.record(session, {
+      const s = await tx.settlement.create({
+        data: {
+          groupId: order.groupId,
+          fromId: order.fromId,
+          toId: order.toId,
+          amount: order.amount,
+          note: "Paid online",
+          date: new Date(),
+          createdById: order.fromId,
+          idempotencyKey: `rzp:${orderId}`,
+          status: "confirmed", // the gateway confirmed it; nobody needs to
+          kind: "payment",
+          gatewayPaymentId: paymentId,
+        },
+        select: { id: true },
+      });
+      await tx.paymentOrder.update({ where: { id: order.id }, data: { settlementId: s.id } });
+      await activityService.record(tx, {
         groupId: order.groupId,
-        actor: String(order.from),
+        actor: order.fromId,
         type: "payment_confirmed",
-        data: { from: order.from, to: order.to, amount: order.amount, settlementId: s!._id, description: "Paid online" },
+        data: { from: order.fromId, to: order.toId, amount: order.amount, settlementId: s.id, description: "Paid online" },
       });
     });
   } catch (err) {
     // The other caller won the race: fine, it's recorded
-    if ((err instanceof AppError && err.statusCode === 409) || isDuplicateKey(err)) {
-      return { order: (await PaymentOrderModel.findById(order._id))!, alreadyDone: true };
+    if ((err instanceof AppError && err.statusCode === 409) || isUniqueViolation(err)) {
+      return { order: (await prisma.paymentOrder.findUnique({ where: { id: order.id } }))!, alreadyDone: true };
     }
     throw err;
   }
 
-  publish(String(order.groupId), String(order.from)); // everyone's page updates live
-  return { order: (await PaymentOrderModel.findById(order._id))!, alreadyDone: false };
+  publish(order.groupId, order.fromId); // everyone's page updates live
+  return { order: (await prisma.paymentOrder.findUnique({ where: { id: order.id } }))!, alreadyDone: false };
 }
 
 /** Razorpay's own record must match our order before we believe it. */
@@ -92,27 +85,29 @@ export const paymentService = {
   async createOrder(group: GroupDoc, actorId: string, input: { to: string; amount: number }) {
     if (!razorpayEnabled()) throw new AppError(503, "Online payments aren't set up on this server");
     if (input.to === actorId) throw new AppError(400, "You can’t pay yourself");
-    if (!group.members.some((m) => String(m.userId) === input.to)) {
+    if (!group.members.some((m) => m.userId === input.to)) {
       throw new AppError(400, "That person isn’t in this group");
     }
 
     const [payer, payee] = await Promise.all([
-      UserModel.findById(actorId, "name email").lean(),
-      UserModel.findById(input.to, "name").lean(),
+      prisma.user.findUnique({ where: { id: actorId }, select: { name: true, email: true } }),
+      prisma.user.findUnique({ where: { id: input.to }, select: { name: true } }),
     ]);
-    const id = new Types.ObjectId();
+    const id = newId();
     const rzp = await razorpay.createOrder({
       amount: input.amount,
       receipt: `hisaab_${id}`, // max 40 characters
       notes: { group: group.name.slice(0, 200), from: payer?.name ?? "", to: payee?.name ?? "" },
     });
-    await PaymentOrderModel.create({
-      _id: id,
-      groupId: group._id,
-      from: actorId,
-      to: input.to,
-      amount: input.amount,
-      orderId: rzp.id,
+    await prisma.paymentOrder.create({
+      data: {
+        id,
+        groupId: group.id,
+        fromId: actorId,
+        toId: input.to,
+        amount: input.amount,
+        orderId: rzp.id,
+      },
     });
 
     return {
@@ -131,8 +126,8 @@ export const paymentService = {
     actorId: string,
     body: { razorpay_order_id: string; razorpay_payment_id: string; razorpay_signature: string },
   ) {
-    const order = await PaymentOrderModel.findOne({ orderId: body.razorpay_order_id, groupId: group._id });
-    if (!order || String(order.from) !== actorId) throw new AppError(404, "Payment not found");
+    const order = await prisma.paymentOrder.findFirst({ where: { orderId: body.razorpay_order_id, groupId: group.id } });
+    if (!order || order.fromId !== actorId) throw new AppError(404, "Payment not found");
     if (!checkoutSignatureValid(body.razorpay_order_id, body.razorpay_payment_id, body.razorpay_signature)) {
       throw new AppError(400, "The payment signature is invalid");
     }
@@ -145,7 +140,7 @@ export const paymentService = {
   async handleWebhook(event: { event?: string; payload?: { payment?: { entity?: RzpPayment } } }) {
     const p = event.payload?.payment?.entity;
     if (!p || !["payment.captured", "order.paid"].includes(event.event ?? "")) return;
-    const order = await PaymentOrderModel.findOne({ orderId: p.order_id });
+    const order = await prisma.paymentOrder.findUnique({ where: { orderId: p.order_id } });
     if (!order) return; // not one of ours
     if (p.amount !== order.amount || p.status !== "captured") {
       logger.warn({ orderId: p.order_id, amount: p.amount, status: p.status }, "Webhook payment doesn't match order");

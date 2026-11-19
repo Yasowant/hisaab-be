@@ -3,6 +3,7 @@ import { ZodError } from "zod";
 import { AppError } from "../utils/AppError";
 import { logger } from "../utils/logger";
 import { isProd } from "../config/env";
+import { isUniqueViolation } from "../utils/dbErrors";
 
 export const errorHandler = (
   err: unknown,
@@ -37,11 +38,7 @@ export const errorHandler = (
   }
 
   // Duplicate key (e.g. two register requests at the same time)
-  if (
-    typeof err === "object" &&
-    err !== null &&
-    (err as { code?: number }).code === 11000
-  ) {
+  if (isUniqueViolation(err)) {
     return res
       .status(409)
       // Registration checks the email itself; anything else is a duplicate we didn't expect

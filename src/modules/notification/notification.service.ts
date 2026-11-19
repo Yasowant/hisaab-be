@@ -1,24 +1,19 @@
-import { ClientSession, Types } from "mongoose";
-import { NotificationModel, type NotificationType } from "./notification.model";
-import { ExpenseModel } from "../expense/expense.model";
-import { SettlementModel } from "../settlement/settlement.model";
-import { GroupModel } from "../group/group.model";
-import { UserModel } from "../user/user.model";
+import { prisma } from "../../config/db";
+import { NotificationData, NotificationType } from "./notification.model";
 import { publishUser } from "../events/events";
 import { emailLayout, sendMail } from "../../utils/mailer";
 import { formatPaise } from "../../utils/money";
 import { env } from "../../config/env";
 import { logger } from "../../utils/logger";
-
-type Id = Types.ObjectId | string;
-type Named = { _id: Types.ObjectId; name: string };
+import { afterCommit, type Db, type Tx } from "../../utils/transaction";
+import { newId } from "../../utils/id";
 
 export type NotifyInput = {
-  recipients: Id[];
-  groupId: Id;
-  actor: Id;
+  recipients: string[];
+  groupId: string;
+  actor: string;
   type: NotificationType;
-  data?: { description?: string; amount?: number; text?: string; expenseId?: Id };
+  data?: { description?: string; amount?: number; text?: string; expenseId?: string };
 };
 
 const short = (s: string, n = 120) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
@@ -84,45 +79,50 @@ function emailFor(
 
 /**
  * Save notifications for these people (never the actor, never placeholders or
- * deleted accounts). Inside a transaction they save with it; each person's open
- * tabs are pinged once the transaction is over.
+ * deleted accounts). Inside a transaction they save with it, and each person's
+ * open tabs are pinged (and emails sent) only once it has committed.
  */
-async function notify(input: NotifyInput, session?: ClientSession) {
+async function notify(input: NotifyInput, db: Db = prisma) {
   const ids = [...new Set(input.recipients.map(String))].filter((id) => id !== String(input.actor));
   if (ids.length === 0) return;
   const [real, group, actor] = await Promise.all([
-    UserModel.find({ _id: { $in: ids }, placeholder: { $ne: true }, deletedAt: null }, "_id name email emailNotifications", { session }).lean(),
-    GroupModel.findById(input.groupId, "name", { session }).lean(),
-    UserModel.findById(input.actor, "name", { session }).lean(),
+    db.user.findMany({
+      where: { id: { in: ids }, placeholder: false, deletedAt: null },
+      select: { id: true, name: true, email: true, emailNotifications: true },
+    }),
+    db.group.findUnique({ where: { id: input.groupId }, select: { name: true } }),
+    db.user.findUnique({ where: { id: input.actor }, select: { name: true } }),
   ]);
   if (real.length === 0) return;
-  const data = { ...input.data, groupName: group?.name, text: input.data?.text ? short(input.data.text) : undefined };
-  const saved = await NotificationModel.insertMany(
-    real.map((u) => ({ userId: u._id, groupId: input.groupId, actor: input.actor, type: input.type, data })),
-    { session },
-  );
-
-  const afterSave = async () => {
-    // A transaction that was rolled back (or retried) leaves no notifications: send nothing for those
-    const kept = session ? await NotificationModel.find({ _id: { $in: saved.map((n) => n._id) } }, "userId").lean() : saved;
-    const keptFor = new Set(kept.map((n) => String(n.userId)));
-    real.filter((u) => keptFor.has(String(u._id))).forEach((u) => publishUser(String(u._id)));
-
-    const mail = emailFor(input.type, actor?.name.split(" ")[0] ?? "Someone", data);
-    if (!mail) return;
-    const link = `${env.APP_URL}/groups/${input.groupId}${input.data?.expenseId ? `?expense=${input.data.expenseId}` : ""}`;
-    for (const u of real) {
-      if (!keptFor.has(String(u._id)) || u.emailNotifications === false) continue;
-      void sendMail({
-        to: u.email,
-        subject: mail.subject,
-        ...emailLayout({ heading: mail.heading, lines: [`Hi ${u.name.split(" ")[0]},`, ...mail.lines], button: { label: mail.button, url: link } }),
-      });
-    }
+  const data: NotificationData = {
+    ...input.data,
+    groupName: group?.name,
+    text: input.data?.text ? short(input.data.text) : undefined,
   };
-  const run = () => afterSave().catch((err) => logger.error({ err }, "Notification follow-up failed"));
-  if (session) session.once("ended", run);
-  else void run();
+  const json = Object.fromEntries(Object.entries(data).filter(([, v]) => v !== undefined));
+  await db.notification.createMany({
+    data: real.map((u) => ({ id: newId(), userId: u.id, groupId: input.groupId, actorId: input.actor, type: input.type, data: json })),
+  });
+
+  afterCommit(db, () => {
+    try {
+      real.forEach((u) => publishUser(u.id));
+
+      const mail = emailFor(input.type, actor?.name.split(" ")[0] ?? "Someone", data);
+      if (!mail) return;
+      const link = `${env.APP_URL}/groups/${input.groupId}${input.data?.expenseId ? `?expense=${input.data.expenseId}` : ""}`;
+      for (const u of real) {
+        if (!u.emailNotifications) continue;
+        void sendMail({
+          to: u.email,
+          subject: mail.subject,
+          ...emailLayout({ heading: mail.heading, lines: [`Hi ${u.name.split(" ")[0]},`, ...mail.lines], button: { label: mail.button, url: link } }),
+        });
+      }
+    } catch (err) {
+      logger.error({ err }, "Notification follow-up failed");
+    }
+  });
 }
 
 export const notificationService = {
@@ -133,49 +133,52 @@ export const notificationService = {
    * Called from activityService.record, in the same transaction.
    */
   async fromActivity(
-    session: ClientSession,
-    entry: { groupId: Id; actor: string; type: string; data: Record<string, unknown> },
+    tx: Tx,
+    entry: { groupId: string; actor: string; type: string; data: Record<string, unknown> },
   ) {
     const base = { groupId: entry.groupId, actor: entry.actor };
     const d = entry.data as {
-      from?: Id;
-      to?: Id;
+      from?: string;
+      to?: string;
       amount?: number;
       description?: string;
       text?: string;
-      expenseId?: Id;
-      settlementId?: Id;
+      expenseId?: string;
+      settlementId?: string;
     };
 
     if (entry.type === "dispute_resolved" && d.from) {
       // Tell the person who flagged it
       await notify(
         { ...base, recipients: [d.from], type: "dispute_resolved", data: { description: d.description, text: d.text, expenseId: d.expenseId } },
-        session,
+        tx,
       );
       return;
     }
 
     if (entry.type.startsWith("expense_") && d.expenseId) {
-      const e = await ExpenseModel.findById(d.expenseId, "paidBy splits createdBy", { session }).lean();
+      const e = await tx.expense.findUnique({
+        where: { id: d.expenseId },
+        select: { paidById: true, createdById: true, splits: { select: { userId: true } } },
+      });
       if (!e) return;
-      const people = [e.paidBy, e.createdBy, ...e.splits.map((s) => s.userId)];
+      const people = [e.paidById, e.createdById, ...e.splits.map((s) => s.userId)];
       const type = entry.type as "expense_added" | "expense_updated" | "expense_deleted" | "expense_disputed";
       await notify(
         { ...base, recipients: people, type, data: { description: d.description, amount: d.amount, text: d.text, expenseId: d.expenseId } },
-        session,
+        tx,
       );
       return;
     }
 
     if (entry.type === "payment_recorded" && d.settlementId) {
-      const s = await SettlementModel.findById(d.settlementId, "status from to", { session }).lean();
+      const s = await tx.settlement.findUnique({ where: { id: d.settlementId }, select: { status: true, fromId: true, toId: true } });
       if (!s) return;
       if (s.status === "pending") {
-        await notify({ ...base, recipients: [s.to], type: "payment_to_confirm", data: { amount: d.amount } }, session);
+        await notify({ ...base, recipients: [s.toId], type: "payment_to_confirm", data: { amount: d.amount } }, tx);
       } else {
         // The receiver recorded it: tell the payer it's been counted
-        await notify({ ...base, recipients: [s.from], type: "payment_confirmed", data: { amount: d.amount } }, session);
+        await notify({ ...base, recipients: [s.fromId], type: "payment_confirmed", data: { amount: d.amount } }, tx);
       }
       return;
     }
@@ -183,55 +186,59 @@ export const notificationService = {
     if (entry.type === "payment_confirmed") {
       // Paid online: the receiver hears money arrived. Otherwise the payer hears it was confirmed.
       if (d.description === "Paid online" && d.to) {
-        await notify({ ...base, recipients: [d.to], type: "payment_received", data: { amount: d.amount, description: "online" } }, session);
+        await notify({ ...base, recipients: [d.to], type: "payment_received", data: { amount: d.amount, description: "online" } }, tx);
       } else if (d.from) {
-        await notify({ ...base, recipients: [d.from], type: "payment_confirmed", data: { amount: d.amount } }, session);
+        await notify({ ...base, recipients: [d.from], type: "payment_confirmed", data: { amount: d.amount } }, tx);
       }
       return;
     }
 
     if (entry.type === "payment_rejected" && d.from) {
-      await notify({ ...base, recipients: [d.from], type: "payment_rejected", data: { amount: d.amount } }, session);
+      await notify({ ...base, recipients: [d.from], type: "payment_rejected", data: { amount: d.amount } }, tx);
     }
   },
 
   async list(userId: string, page: number, limit: number) {
-    const filter = { userId };
+    const where = { userId };
     const [docs, total, unread] = await Promise.all([
-      NotificationModel.find(filter)
-        .sort({ createdAt: -1, _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .populate<{ actor: Named }>("actor", "name")
-        .lean(),
-      NotificationModel.countDocuments(filter),
-      NotificationModel.countDocuments({ userId, readAt: null }),
+      prisma.notification.findMany({
+        where,
+        orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+        skip: (page - 1) * limit,
+        take: limit,
+        include: { actor: { select: { id: true, name: true } } },
+      }),
+      prisma.notification.count({ where }),
+      prisma.notification.count({ where: { userId, readAt: null } }),
     ]);
     return {
-      items: docs.map((n) => ({
-        id: String(n._id),
-        type: n.type,
-        groupId: String(n.groupId),
-        groupName: n.data?.groupName ?? "",
-        actor: { id: String(n.actor._id), name: n.actor.name },
-        description: n.data?.description ?? null,
-        amount: n.data?.amount ?? null,
-        text: n.data?.text ?? null,
-        expenseId: n.data?.expenseId ? String(n.data.expenseId) : null,
-        read: Boolean(n.readAt),
-        createdAt: n.createdAt,
-      })),
+      items: docs.map((n) => {
+        const d = (n.data ?? {}) as NotificationData;
+        return {
+          id: n.id,
+          type: n.type,
+          groupId: n.groupId,
+          groupName: d.groupName ?? "",
+          actor: { id: n.actor.id, name: n.actor.name },
+          description: d.description ?? null,
+          amount: d.amount ?? null,
+          text: d.text ?? null,
+          expenseId: d.expenseId ?? null,
+          read: Boolean(n.readAt),
+          createdAt: n.createdAt,
+        };
+      }),
       unread,
       meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
     };
   },
 
-  unreadCount: (userId: string) => NotificationModel.countDocuments({ userId, readAt: null }),
+  unreadCount: (userId: string) => prisma.notification.count({ where: { userId, readAt: null } }),
 
   /** Mark some (by id) or all of my notifications as read. */
   async markRead(userId: string, ids?: string[]) {
-    const filter = ids?.length ? { userId, _id: { $in: ids }, readAt: null } : { userId, readAt: null };
-    const res = await NotificationModel.updateMany(filter, { $set: { readAt: new Date() } });
-    return res.modifiedCount;
+    const where = ids?.length ? { userId, id: { in: ids }, readAt: null } : { userId, readAt: null };
+    const res = await prisma.notification.updateMany({ where, data: { readAt: new Date() } });
+    return res.count;
   },
 };

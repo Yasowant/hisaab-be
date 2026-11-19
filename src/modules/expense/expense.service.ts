@@ -1,7 +1,7 @@
-import { isValidObjectId, Types, type ClientSession } from "mongoose";
-import { ExpenseModel } from "./expense.model";
+import { prisma } from "../../config/db";
+import { Prisma } from "../../generated/prisma/client";
+import { StoredItem, StoredOriginal } from "./expense.model";
 import { GroupDoc } from "../group/group.model";
-import { CommentModel } from "../comment/comment.model";
 import { AppError } from "../../utils/AppError";
 import {
   formatPaise,
@@ -13,9 +13,8 @@ import {
 } from "../../utils/money";
 import { CreateExpenseInput, ExpenseInput, ListExpensesQuery, UpdateExpenseInput } from "./expense.schema";
 import { activityService } from "../activity/activity.service";
-import { inTransaction } from "../../utils/transaction";
-
-type Named = { _id: Types.ObjectId; name: string };
+import { inTransaction, type Tx } from "../../utils/transaction";
+import { isId } from "../../utils/id";
 
 type StoredSplit = Share & { percent?: number };
 
@@ -78,13 +77,13 @@ function buildSplits(input: ExpenseInput, memberIds: Set<string>): StoredSplit[]
 }
 
 export function toFields(input: ExpenseInput, group: GroupDoc) {
-  const memberIds = new Set(group.members.map((m) => String(m.userId)));
+  const memberIds = new Set(group.members.map((m) => m.userId));
 
   // Paid from the kitty → the kitty holder is the payer
   let paidBy = input.paidBy;
   if (input.fromKitty) {
     if (!group.kittyHolderId) throw new AppError(400, "This group doesn't have a kitty");
-    paidBy = String(group.kittyHolderId);
+    paidBy = group.kittyHolderId;
   }
   const resolved = { ...input, paidBy } as ExpenseInput;
 
@@ -108,84 +107,116 @@ export function toFields(input: ExpenseInput, group: GroupDoc) {
   };
 }
 
-const populated = <T>(q: T) => q;
 
-/** Loads one expense with names filled in, shaped for the API. */
-async function findOne(groupId: Types.ObjectId | string, expenseId: string) {
-  if (!isValidObjectId(expenseId)) return null;
-  return populated(
-    ExpenseModel.findOne({ _id: expenseId, groupId, deletedAt: null })
-      .populate<{ paidBy: Named }>("paidBy", "name")
-      .populate<{ splits: { userId: Named; amount: number; percent?: number }[] }>("splits.userId", "name")
-      .populate<{ dispute: { by: Named; reason: string; at: Date } | null }>("dispute.by", "name")
-      .lean(),
-  );
+/** Everything the API shows for an expense, loaded in one query. */
+const expenseInclude = {
+  paidBy: { select: { id: true, name: true } },
+  disputeBy: { select: { id: true, name: true } },
+  splits: { orderBy: { position: "asc" }, include: { user: { select: { id: true, name: true } } } },
+  receipt: { select: { contentType: true } },
+  _count: { select: { comments: { where: { deletedAt: null } } } },
+} satisfies Prisma.ExpenseInclude;
+
+type Loaded = Prisma.ExpenseGetPayload<{ include: typeof expenseInclude }>;
+
+/** Loads one expense with names filled in. */
+async function findOne(groupId: string, expenseId: string) {
+  if (!isId(expenseId)) return null;
+  return prisma.expense.findFirst({ where: { id: expenseId, groupId, deletedAt: null }, include: expenseInclude });
 }
 
-type Loaded = NonNullable<Awaited<ReturnType<typeof findOne>>>;
-
-function toDTO(e: Loaded, commentCount = 0) {
+function toDTO(e: Loaded) {
+  const items = e.items as StoredItem[] | null;
+  const original = e.original as StoredOriginal | null;
   return {
-    id: String(e._id),
+    id: e.id,
     description: e.description,
     amount: e.amount,
-    paidBy: { id: String(e.paidBy._id), name: e.paidBy.name },
+    paidBy: { id: e.paidBy.id, name: e.paidBy.name },
     splitType: e.splitType,
     splits: e.splits.map((s) => ({
-      userId: String(s.userId._id),
-      name: s.userId.name,
+      userId: s.user.id,
+      name: s.user.name,
       amount: s.amount,
-      ...(s.percent !== undefined && s.percent !== null ? { percent: s.percent } : {}),
+      ...(s.percent !== null ? { percent: s.percent } : {}),
     })),
-    items: e.items?.map((i) => ({ name: i.name, amount: i.amount, sharedBy: i.sharedBy.map(String) })) ?? null,
+    items: items?.map((i) => ({ name: i.name, amount: i.amount, sharedBy: i.sharedBy.map(String) })) ?? null,
     extras: e.extras ?? null,
     category: e.category,
     date: e.date,
-    fromKitty: Boolean(e.fromKitty),
-    original: e.original ? { currency: e.original.currency, amount: e.original.amount, rate: e.original.rate } : null,
-    recurringId: e.recurringId ? String(e.recurringId) : null,
-    commentCount,
-    dispute: e.dispute?.by
-      ? { by: { id: String(e.dispute.by._id), name: e.dispute.by.name }, reason: e.dispute.reason, at: e.dispute.at }
+    fromKitty: e.fromKitty,
+    original: original ? { currency: original.currency, amount: original.amount, rate: original.rate } : null,
+    recurringId: e.recurringId ?? null,
+    commentCount: e._count.comments,
+    dispute: e.disputeBy
+      ? { by: { id: e.disputeBy.id, name: e.disputeBy.name }, reason: e.disputeReason ?? "", at: e.disputeAt }
       : null,
     hasReceipt: Boolean(e.receipt),
     receiptType: e.receipt ? (e.receipt.contentType === "application/pdf" ? "pdf" : "image") : null,
-    createdBy: String(e.createdBy),
-    version: e.__v,
+    createdBy: e.createdById,
+    version: e.version,
     createdAt: e.createdAt,
     updatedAt: e.updatedAt,
   };
 }
 
 /** The person who added it, the person who paid, or a group admin can change it. */
-function ensureCanChange(e: { createdBy: unknown; paidBy: { _id: unknown } }, userId: string, role: string) {
-  const allowed = role === "admin" || String(e.createdBy) === userId || String(e.paidBy._id) === userId;
+function ensureCanChange(e: { createdById: string; paidById: string }, userId: string, role: string) {
+  const allowed = role === "admin" || e.createdById === userId || e.paidById === userId;
   if (!allowed) {
     throw new AppError(403, "Only the person who added or paid for this, or a group admin, can change it");
   }
 }
 
-const escapeRegex = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+type Fields = ReturnType<typeof toFields>;
+
+/** The columns for an expense (splits are saved separately). */
+function columns(fields: Fields) {
+  return {
+    description: fields.description,
+    amount: fields.amount,
+    paidById: fields.paidBy,
+    splitType: fields.splitType,
+    category: fields.category,
+    date: fields.date,
+    fromKitty: fields.fromKitty,
+    original: fields.original ?? Prisma.DbNull,
+    // Switching away from itemized clears the stored lines
+    items: fields.items ?? Prisma.DbNull,
+    extras: fields.extras ?? null,
+  };
+}
+
+const splitRows = (fields: Fields) =>
+  fields.splits.map((s, i) => ({ userId: s.userId, amount: s.amount, percent: s.percent ?? null, position: i }));
 
 /** Insert an expense + its activity entry in the caller's transaction. Used by create and by repeats. */
 export async function insertExpense(
-  session: ClientSession,
+  tx: Tx,
   group: GroupDoc,
   actorId: string,
-  fields: ReturnType<typeof toFields>,
-  extra: { recurringId?: Types.ObjectId } = {},
+  fields: Fields,
+  extra: { recurringId?: string } = {},
 ) {
-  const [created] = await ExpenseModel.create([{ ...fields, ...extra, groupId: group._id, createdBy: actorId }], {
-    session,
+  const created = await tx.expense.create({
+    data: {
+      ...columns(fields),
+      groupId: group.id,
+      createdById: actorId,
+      recurringId: extra.recurringId ?? null,
+      splits: { create: splitRows(fields) },
+    },
+    select: { id: true },
   });
-  await activityService.record(session, {
-    groupId: group._id,
+  await activityService.record(tx, {
+    groupId: group.id,
     actor: actorId,
     type: "expense_added",
-    data: { description: fields.description, amount: fields.amount, expenseId: created!._id },
+    data: { description: fields.description, amount: fields.amount, expenseId: created.id },
   });
-  return created!;
+  return created;
 }
 
 export const expenseService = {
@@ -194,98 +225,86 @@ export const expenseService = {
     const fields = toFields(rest as ExpenseInput, group);
 
     // The expense, its activity entry and (if asked) its repeat schedule save together
-    const id = await inTransaction(async (session) => {
-      let recurringId: Types.ObjectId | undefined;
+    const id = await inTransaction(async (tx) => {
+      let recurringId: string | undefined;
       if (repeat !== "none") {
         // Imported here to avoid a circular import at load time
         const { recurringService } = await import("../recurring/recurring.service");
-        recurringId = await recurringService.createFrom(session, group, userId, rest as ExpenseInput, repeat);
+        recurringId = await recurringService.createFrom(tx, group, userId, rest as ExpenseInput, repeat);
       }
-      const created = await insertExpense(session, group, userId, fields, { recurringId });
-      return created.id as string;
+      const created = await insertExpense(tx, group, userId, fields, { recurringId });
+      return created.id;
     });
-    return toDTO((await findOne(group._id, id))!);
+    return toDTO((await findOne(group.id, id))!);
   },
 
   async list(group: GroupDoc, query: ListExpensesQuery) {
     const { page, limit, q, category, paidBy, involving, from, to, disputed } = query;
-    const filter: Record<string, unknown> = { groupId: group._id, deletedAt: null };
-    if (q) filter.description = { $regex: escapeRegex(q), $options: "i" };
-    if (category) filter.category = category;
-    if (paidBy) filter.paidBy = paidBy;
-    if (involving) filter.$or = [{ paidBy: involving }, { "splits.userId": involving }];
-    if (disputed === "true") filter.dispute = { $ne: null };
+    const where: Prisma.ExpenseWhereInput = { groupId: group.id, deletedAt: null };
+    if (q) where.description = { contains: q, mode: "insensitive" };
+    if (category) where.category = category;
+    if (paidBy) where.paidById = paidBy;
+    if (involving) where.OR = [{ paidById: involving }, { splits: { some: { userId: involving } } }];
+    if (disputed === "true") where.disputeById = { not: null };
     if (from || to) {
-      filter.date = {
-        ...(from ? { $gte: from } : {}),
+      where.date = {
+        ...(from ? { gte: from } : {}),
         // "to" is a calendar day: include the whole of it
-        ...(to ? { $lt: new Date(to.getTime() + DAY_MS) } : {}),
+        ...(to ? { lt: new Date(to.getTime() + DAY_MS) } : {}),
       };
     }
 
     const [docs, total] = await Promise.all([
-      ExpenseModel.find(filter)
-        .sort({ date: -1, _id: -1 })
-        .skip((page - 1) * limit)
-        .limit(limit)
-        .populate<{ paidBy: Named }>("paidBy", "name")
-        .populate<{ splits: { userId: Named; amount: number; percent?: number }[] }>("splits.userId", "name")
-        .populate<{ dispute: { by: Named; reason: string; at: Date } | null }>("dispute.by", "name")
-        .lean(),
-      ExpenseModel.countDocuments(filter),
+      prisma.expense.findMany({
+        where,
+        orderBy: [{ date: "desc" }, { id: "desc" }],
+        skip: (page - 1) * limit,
+        take: limit,
+        include: expenseInclude,
+      }),
+      prisma.expense.count({ where }),
     ]);
-
-    // Comment counts for just this page of expenses, in one query
-    const counts = await CommentModel.aggregate<{ _id: Types.ObjectId; n: number }>([
-      { $match: { expenseId: { $in: docs.map((d) => d._id) }, deletedAt: null } },
-      { $group: { _id: "$expenseId", n: { $sum: 1 } } },
-    ]);
-    const countOf = new Map(counts.map((c) => [String(c._id), c.n]));
 
     return {
-      items: docs.map((d) => toDTO(d, countOf.get(String(d._id)) ?? 0)),
+      items: docs.map(toDTO),
       meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
     };
   },
 
   async getOne(group: GroupDoc, expenseId: string) {
-    const e = await findOne(group._id, expenseId);
+    const e = await findOne(group.id, expenseId);
     if (!e) throw new AppError(404, "Expense not found");
-    const commentCount = await CommentModel.countDocuments({ expenseId: e._id, deletedAt: null });
-    return toDTO(e, commentCount);
+    return toDTO(e);
   },
 
   async update(group: GroupDoc, userId: string, role: string, expenseId: string, input: UpdateExpenseInput) {
-    const current = await findOne(group._id, expenseId);
+    const current = await findOne(group.id, expenseId);
     if (!current) throw new AppError(404, "Expense not found");
     ensureCanChange(current, userId, role);
 
     const { version, ...rest } = input;
     const fields = toFields(rest as ExpenseInput, group);
-    // Switching away from itemized clears the stored lines
-    const unset = rest.splitType === "itemized" ? {} : { items: 1, extras: 1 };
-    const { items, extras, ...plain } = fields;
-    const set = rest.splitType === "itemized" ? { ...plain, items, extras } : plain;
 
-    await inTransaction(async (session) => {
-      // Only saves if nobody else saved since this client loaded it (its __v still matches)
-      const updated = await ExpenseModel.findOneAndUpdate(
-        { _id: expenseId, groupId: group._id, deletedAt: null, __v: version },
-        { $set: set, $unset: unset, $inc: { __v: 1 } },
-        { returnDocument: "after", runValidators: true, session },
-      );
-      if (!updated) {
+    await inTransaction(async (tx) => {
+      // Only saves if nobody else saved since this client loaded it (its version still matches)
+      const updated = await tx.expense.updateMany({
+        where: { id: expenseId, groupId: group.id, deletedAt: null, version },
+        data: { ...columns(fields), version: { increment: 1 } },
+      });
+      if (updated.count === 0) {
         throw new AppError(409, "Someone else changed this expense. Reload it and try again.");
       }
-      await activityService.record(session, {
-        groupId: group._id,
+      await tx.expenseSplit.deleteMany({ where: { expenseId } });
+      await tx.expenseSplit.createMany({ data: splitRows(fields).map((r) => ({ ...r, expenseId })) });
+      await activityService.record(tx, {
+        groupId: group.id,
         actor: userId,
         type: "expense_updated",
         data: {
           description: fields.description,
           amount: fields.amount,
           previousAmount: current.amount,
-          expenseId: current._id,
+          expenseId: current.id,
         },
       });
     });
@@ -293,45 +312,43 @@ export const expenseService = {
   },
 
   async remove(group: GroupDoc, userId: string, role: string, expenseId: string) {
-    const current = await findOne(group._id, expenseId);
+    const current = await findOne(group.id, expenseId);
     if (!current) throw new AppError(404, "Expense not found");
     ensureCanChange(current, userId, role);
 
     // Soft delete: the history stays, balances skip it
-    await inTransaction(async (session) => {
-      const res = await ExpenseModel.updateOne(
-        { _id: expenseId, deletedAt: null },
-        { $set: { deletedAt: new Date() }, $inc: { __v: 1 } },
-        { session },
-      );
-      if (res.modifiedCount === 0) throw new AppError(404, "Expense not found");
-      await activityService.record(session, {
-        groupId: group._id,
+    await inTransaction(async (tx) => {
+      const res = await tx.expense.updateMany({
+        where: { id: expenseId, deletedAt: null },
+        data: { deletedAt: new Date(), version: { increment: 1 } },
+      });
+      if (res.count === 0) throw new AppError(404, "Expense not found");
+      await activityService.record(tx, {
+        groupId: group.id,
         actor: userId,
         type: "expense_deleted",
-        data: { description: current.description, amount: current.amount, expenseId: current._id },
+        data: { description: current.description, amount: current.amount, expenseId: current.id },
       });
     });
   },
 
   /** "Something's wrong": any member can flag an expense once. It still counts until it's changed. */
   async dispute(group: GroupDoc, userId: string, expenseId: string, reason: string) {
-    const current = await findOne(group._id, expenseId);
+    const current = await findOne(group.id, expenseId);
     if (!current) throw new AppError(404, "Expense not found");
-    await inTransaction(async (session) => {
-      const res = await ExpenseModel.updateOne(
-        { _id: expenseId, groupId: group._id, deletedAt: null, dispute: null },
-        { $set: { dispute: { by: userId, reason, at: new Date() } } },
-        { session },
-      );
-      if (res.modifiedCount === 0) throw new AppError(409, "This expense is already flagged");
+    await inTransaction(async (tx) => {
+      const res = await tx.expense.updateMany({
+        where: { id: expenseId, groupId: group.id, deletedAt: null, disputeById: null },
+        data: { disputeById: userId, disputeReason: reason, disputeAt: new Date() },
+      });
+      if (res.count === 0) throw new AppError(409, "This expense is already flagged");
       // The reason starts the conversation in the comments
-      await CommentModel.create([{ groupId: group._id, expenseId, userId, text: `Flagged: ${reason}` }], { session });
-      await activityService.record(session, {
-        groupId: group._id,
+      await tx.comment.create({ data: { groupId: group.id, expenseId, userId, text: `Flagged: ${reason}` } });
+      await activityService.record(tx, {
+        groupId: group.id,
         actor: userId,
         type: "expense_disputed",
-        data: { description: current.description, amount: current.amount, text: reason, expenseId: current._id },
+        data: { description: current.description, amount: current.amount, text: reason, expenseId: current.id },
       });
     });
     return this.getOne(group, expenseId);
@@ -339,28 +356,26 @@ export const expenseService = {
 
   /** Clear the flag: the person who flagged it, or anyone who can change the expense. */
   async resolveDispute(group: GroupDoc, userId: string, role: string, expenseId: string, note?: string) {
-    const current = await findOne(group._id, expenseId);
+    const current = await findOne(group.id, expenseId);
     if (!current) throw new AppError(404, "Expense not found");
-    if (!current.dispute) throw new AppError(409, "This expense isn’t flagged");
-    const flaggedBy = String(current.dispute.by._id);
+    if (!current.disputeById) throw new AppError(409, "This expense isn’t flagged");
+    const flaggedBy = current.disputeById;
     if (flaggedBy !== userId) ensureCanChange(current, userId, role);
 
-    await inTransaction(async (session) => {
-      const res = await ExpenseModel.updateOne(
-        { _id: expenseId, groupId: group._id, "dispute.by": current.dispute!.by._id },
-        { $set: { dispute: null } },
-        { session },
-      );
-      if (res.modifiedCount === 0) throw new AppError(409, "Someone already sorted this out");
-      await CommentModel.create(
-        [{ groupId: group._id, expenseId, userId, text: note ? `Sorted: ${note}` : "Marked as sorted" }],
-        { session },
-      );
-      await activityService.record(session, {
-        groupId: group._id,
+    await inTransaction(async (tx) => {
+      const res = await tx.expense.updateMany({
+        where: { id: expenseId, groupId: group.id, disputeById: flaggedBy },
+        data: { disputeById: null, disputeReason: null, disputeAt: null },
+      });
+      if (res.count === 0) throw new AppError(409, "Someone already sorted this out");
+      await tx.comment.create({
+        data: { groupId: group.id, expenseId, userId, text: note ? `Sorted: ${note}` : "Marked as sorted" },
+      });
+      await activityService.record(tx, {
+        groupId: group.id,
         actor: userId,
         type: "dispute_resolved",
-        data: { description: current.description, from: flaggedBy, text: note, expenseId: current._id },
+        data: { description: current.description, from: flaggedBy, text: note, expenseId: current.id },
       });
     });
     return this.getOne(group, expenseId);
