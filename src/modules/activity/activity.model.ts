@@ -1,4 +1,4 @@
-// The table lives in prisma/schema.prisma (Activity); this file keeps the shared constants.
+// The table lives in prisma/schema.prisma (Activity); this file keeps the shared constants
 
 export const ACTIVITY_TYPES = [
   "expense_added",
